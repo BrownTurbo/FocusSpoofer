@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "Focus Pro",
+  "version": "1.1",
+  "description": "Advanced visibility and focus spoofing for Firefox",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "focus-spoofer@brownturbo",
+      "strict_min_version": "111.0"
+    }
+  },
+  "permissions": ["scripting"],
+  "host_permissions": ["<all_urls>"],
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["extension.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ]
+}
