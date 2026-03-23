@@ -18,5 +18,10 @@
       "run_at": "document_start",
       "world": "MAIN"
     }
-  ]
+  ],
+  "author": "John Magdy Lotfy (Zorono)",
+  "developer": {
+    "name": "John Magdy Lotfy (Zorono)",
+    "url": "https://github.com/Zorono"
+  }
 }
