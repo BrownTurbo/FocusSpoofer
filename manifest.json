@@ -6,7 +6,12 @@
   "browser_specific_settings": {
     "gecko": {
       "id": "focus-spoofer@brownturbo",
-      "strict_min_version": "111.0"
+      "strict_min_version": "140.0",
+      "data_collection_permissions": {
+        "telemetry": false,
+        "hotfix": false,
+        "required": ["none"]
+      }
     }
   },
   "permissions": ["scripting"],
