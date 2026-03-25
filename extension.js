@@ -10,6 +10,8 @@
         debounceThreshold: 50, // ms — ignore duplicate state-change events
         syncInterval: 500, // ms — BroadcastChannel / iframe / worker sync
     };
+    
+    let lastKnownActiveElement = null;
 
     // Capture performance.now / Date.now *before any patching* so the
     // internal clock always runs on real wall-clock time.
@@ -128,7 +130,7 @@
     const realHiddenGetter =
         Object.getOwnPropertyDescriptor(Document.prototype, 'hidden').get;
 
-    const setHidden = (hidden) =>
+    const setHidden = (hidden, event = null) =>
     {
         const now = _realPerfNow();
         if (now - lastStateChange < CONFIG.debounceThreshold) return;
@@ -137,6 +139,29 @@
         updateVirtualClock();
         isTabActuallyHidden = hidden;
         lastStateChange = now;
+
+        if (!hidden && event && event.target) {
+            const target = event.target;
+            // Case 1: Only store if it's an actual Element (nodeType 1)
+            if (target.nodeType === 1) {
+                lastKnownActiveElement = target;
+            }
+            // Case 2: Document or Window (Global focus)
+            else if (target.nodeType === 9 || target === window) {
+                // Check if there is already a focused element in the DOM
+                // otherwise fallback to body.
+                lastKnownActiveElement = document.activeElement || document.body;
+            }
+            
+            // Deep Stealth: If the target is inside a Shadow DOM, 
+            // we should try to get the actual inner element.
+            if (lastKnownActiveElement && lastKnownActiveElement.shadowRoot) {
+                const inner = lastKnownActiveElement.shadowRoot.activeElement;
+                if (inner) {
+                    lastKnownActiveElement = inner;
+                }
+            }
+        }
 
         if (!hidden)
         {
@@ -149,7 +174,6 @@
 
         if (isLeader)
         {
-
             channel.postMessage({ type: 'sync', ...getTimeState() });
         }
 
@@ -159,22 +183,36 @@
     // ─── 3. REAL EVENT LISTENERS (registered on raw addEventListener) ─────────
     // These must be installed *before* we hijack addEventListener so that our
     // own state-tracking is never nuked by the blacklist logic below.
+    const internalListeners = new WeakSet();
+    const listenerMap = new WeakMap();
     const _origAEL = EventTarget.prototype.addEventListener;
     const _origREL = EventTarget.prototype.removeEventListener;
 
     // Shortcut: attach via raw prototype call
-    const rawListen = (target, type, fn, opts) =>
-        _origAEL.call(target, type, fn, opts);
+    const rawListen = (target, type, fn, opts) => {
+        internalListeners.add(type);
+        return _origAEL.call(target, type, fn, opts);
+    };
+    
+    const handleVisibility = (e) => {
+        try {
+            const isHidden = realHiddenGetter.call(document);
+            setHidden(isHidden, e);
+        } catch (err) {
+            // Fallback if Document prototype is heavily mangled by other scripts
+            setHidden(false, e); 
+        }
+    };
 
-    rawListen(window, 'blur', () => setHidden(true), { capture: true, passive: true });
-    rawListen(window, 'focus', () => setHidden(false), { capture: true, passive: true });
-    rawListen(window, 'focusout', () => setHidden(true), { capture: true, passive: true });
-    rawListen(window, 'focusin', () => setHidden(false), { capture: true, passive: true });
-    rawListen(window, 'pagehide', () => setHidden(true), { capture: true, passive: true });
-    rawListen(window, 'pageshow', () => setHidden(false), { capture: true, passive: true });
-    rawListen(window, 'visibilitychange', () => setHidden(realHiddenGetter.call(document)), { capture: true, passive: true });
-    rawListen(window, 'webkitvisibilitychange', () => setHidden(realHiddenGetter.call(document)), { capture: true, passive: true });
-    rawListen(window, 'mozvisibilitychange', () => setHidden(realHiddenGetter.call(document)), { capture: true, passive: true });
+    rawListen(window, 'blur', (e) => setHidden(true, e), { capture: true, passive: true });
+    rawListen(window, 'focus', (e) => setHidden(false, e), { capture: true, passive: true });
+    rawListen(window, 'focusout', (e) => setHidden(true, e), { capture: true, passive: true });
+    rawListen(window, 'focusin', (e) => setHidden(false, e), { capture: true, passive: true });
+    rawListen(window, 'pagehide', (e) => setHidden(true, e), { capture: true, passive: true });
+    rawListen(window, 'pageshow', (e) => setHidden(false, e), { capture: true, passive: true });
+    rawListen(window, 'visibilitychange', (e) => handleVisibility(e), { capture: true, passive: true });
+    rawListen(window, 'webkitvisibilitychange', (e) => handleVisibility(e), { capture: true, passive: true });
+    rawListen(window, 'mozvisibilitychange', (e) => handleVisibility(e), { capture: true, passive: true });
 
     // ─── 4. OVERRIDE performance.now ──────────────────────────────────────────
     window.performance.now = function()
@@ -207,6 +245,7 @@
         }
         return new OriginalDate(...args);
     }
+    Object.setPrototypeOf(MockDate, OriginalDate);
     MockDate.prototype = OriginalDate.prototype;
     MockDate.prototype.constructor = MockDate;
 
@@ -267,24 +306,52 @@
         catch (_) {}
     }
 
-    const hasFocusTrue = () => true;
-    const hasFocusDescriptor = { configurable: false, writable: false, value: hasFocusTrue };
-    try { Object.defineProperty(Document.prototype, 'hasFocus', hasFocusDescriptor); }
-    catch (_) {}
-    try { Object.defineProperty(document, 'hasFocus', hasFocusDescriptor); }
-    catch (_) {}
+    const patchActiveElement = (Proto) => {
+        const originalDescriptor = Object.getOwnPropertyDescriptor(Proto, 'activeElement');
+        if (!originalDescriptor || !originalDescriptor.get) return;
+
+        Object.defineProperty(Proto, 'activeElement', {
+            configurable: true,
+            enumerable: true,
+            get: function() {
+                const realActive = originalDescriptor.get.call(this);
+
+                // Logic: If the tab is virtually focused but the real browser says 
+                // focus is lost (null/body), return our last 'good' element.
+                if (!isTabActuallyHidden) {
+                    return realActive;
+                }
+
+                // If we are spoofing focus, don't let the site see 'null' or 'body'
+                // if they previously had a specific input/button focused.
+                if (realActive === null || realActive === document.body) {
+                    return lastKnownActiveElement || document.body;
+                }
+
+                return realActive;
+            }
+        });
+    };
+
+    // Patch both Document and ShadowRoot (for Web Components support)
+    patchActiveElement(Document.prototype);
+    if (window.ShadowRoot) {
+        patchActiveElement(ShadowRoot.prototype);
+    }
+
+    const origHasFocus = document.hasFocus;
+    document.hasFocus = function() {
+        if (!isTabActuallyHidden) return origHasFocus.call(this);
+        return true; // Lie and say we still have focus
+    };
+    markAsNative(document.hasFocus);
 
     // ─── 8. EVENT INTERCEPTION ────────────────────────────────────────────────
-    const blacklistedEvents = new Set([
-        'visibilitychange', 'webkitvisibilitychange', 'mozvisibilitychange',
-        'blur', 'focusout', 'pagehide', 'pageshow', 'focusin', 'focus',
-    ]);
-
     // Hijack addEventListener — site-registered handlers for blacklisted
     // events are replaced with a noop that also stops propagation.
     EventTarget.prototype.addEventListener = function(type, listener, options)
     {
-        if (blacklistedEvents.has(type))
+        if (internalListeners.has(type))
         {
             const noop = (e) =>
             {
@@ -293,8 +360,41 @@
             };
             return _origAEL.call(this, type, noop, options);
         }
+        
+        // For all other events, create a proxy to spoof isTrusted or other props if needed
+        let wrapped = listenerMap.get(listener);
+        if (!wrapped) {
+            wrapped = function(event) {
+                // Ensure event identity is preserved while spoofing trust
+                try {
+                    Object.defineProperty(event, 'isTrusted', { 
+                        get: () => true,
+                        configurable: true 
+                    });
+                } catch(e) {}
+                return listener.apply(this, arguments);
+            };
+            listenerMap.set(listener, wrapped);
+        }
         return _origAEL.apply(this, arguments);
     };
+
+    EventTarget.prototype.removeEventListener = function(type, listener, options) {
+        // If it's one of our internal engine listeners, remove it directly
+        if (internalListeners.has(type)) {
+            return _origREL.apply(this, arguments);
+        }
+
+        // Look up our proxy/noop. If the site calls remove(OriginalFunc), 
+        // we must call _origREL(WrappedFunc/Noop) for the browser to find it.
+        const wrapped = listenerMap.get(listener);
+        const targetListener = wrapped || listener;
+
+        return _origREL.call(this, type, targetListener, options);
+    };
+
+    markAsNative(EventTarget.prototype.addEventListener);
+    markAsNative(EventTarget.prototype.removeEventListener);
 
     // Belt-and-suspenders: raw capture listeners that kill the event *early*.
     const killEvent = (e) =>
@@ -584,83 +684,87 @@
     markAsNative(window.IntersectionObserver);
 
     // ─── 15. WORKER PATCHING ─────────────────────────────────────────────────
-    const workerInjection = `
-        let virtualTime = performance.now();
-        let lastW       = performance.now();
-        let hiddenW     = false;
-        const driftW    = ${CONFIG.driftFactor};
+    window.Worker = function WorkerProxy(scriptURL, options) {
+        // 1. Resolve relative URLs (e.g., "/worker.js") to absolute URLs 
+        // based on the current page's origin. This fixes the importScripts crash.
+        const absoluteUrl = new URL(scriptURL, window.location.href).href;
 
-        const updateW = () => {
-            const now   = performance.now();
-            const delta = now - lastW;
-            virtualTime += hiddenW ? delta * driftW : delta;
-            lastW = now;
+        // 2. The code we want to execute INSIDE the worker BEFORE the real script runs
+        const workerPatchCode = `
+            let virtualTime = performance.now();
+            let lastReal = performance.now();
+            let hidden = false;
+            const drift = ${CONFIG.driftFactor};
+
+            const update = () => {
+                const now = performance.now();
+                const delta = now - lastReal;
+                virtualTime += hidden ? delta * drift : delta;
+                lastReal = now;
+            };
+
+            const epochOffset = Date.now() - performance.now();
+
+            // Patch Globals
+            const origPerfNow = performance.now;
+            performance.now = function() { update(); return virtualTime; };
+            Date.now = function() { return Math.floor(epochOffset + performance.now()); };
+
+            // Hide our sync messages from the real worker script
+            const origAddEventListener = self.addEventListener;
+            self.addEventListener = function(type, listener, opts) {
+                if (type === 'message') {
+                    const wrapped = (e) => {
+                        if (e.data && e.data.__sync) return; // Drop our internal messages
+                        return listener.call(this, e);
+                    };
+                    return origAddEventListener.call(this, type, wrapped, opts);
+                }
+                return origAddEventListener.apply(this, arguments);
+            };
+
+            // Listen for main-thread synchronization
+            origAddEventListener.call(self, 'message', (e) => {
+                if (e.data && e.data.__sync) {
+                    virtualTime = e.data.t;
+                    hidden = e.data.h;
+                    e.stopImmediatePropagation(); // Prevent other listeners from seeing this
+                }
+            });
+        `;
+
+        // 3. Assemble the final Blob: Our patch runs FIRST, then we import the real script
+        const blobContent = `${workerPatchCode}\n\nimportScripts("${absoluteUrl}");`;
+        const blobUrl = URL.createObjectURL(new Blob([blobContent], { type: 'application/javascript' }));
+
+        // 4. Initialize the real worker using our patched Blob
+        const worker = new OriginalWorker(blobUrl, options);
+
+        Object.defineProperty(worker, 'scriptURL', {
+            configurable: true,
+            enumerable: true,
+            get: () => scriptURL,
+        });
+
+        // 5. Setup continuous synchronization from the Main Thread to the Worker
+        const syncState = () => {
+            try {
+                worker.postMessage({ 
+                    __sync: true, 
+                    t: virtualTime, // from your main extension.js state
+                    h: isTabActuallyHidden 
+                });
+            } catch (e) {}
         };
 
-        const _origNow  = performance.now.bind(performance);
-        const epochOffW = Date.now() - _origNow();
+        // Piggyback off your existing originalSetInterval
+        originalSetInterval.call(window, syncState, CONFIG.syncInterval);
+        syncState();
 
-        performance.now = function () { updateW(); return virtualTime; };
-        Date.now        = function () { return Math.floor(epochOffW + performance.now()); };
-
-        self.onmessage = (e) => {
-            if (e.data && e.data.__sync) {
-                virtualTime = e.data.t;
-                hiddenW     = !!e.data.h;
-            }
-        };
-
-        self.Worker = function () { throw new Error('Nested workers are blocked.'); };
-
-        /* FIX #1: pure accessor descriptor — no writable key */
-        try {
-            Object.defineProperty(performance, 'timeOrigin', {
-                configurable: true,
-                enumerable:   true,
-                get: () => epochOffW,
-            });
-        } catch (_) {}
-    `;
-
-    window.Worker = function WorkerProxy(scriptURL, options)
-    {
-        try
-        {
-            const blobSrc = new Blob([
-                workerInjection,
-                `\ntry {
-    importScripts(${JSON.stringify(String(scriptURL))});
-} catch (_importErr) {
-    fetch(${JSON.stringify(String(scriptURL))})
-        .then(r => r.text())
-        .then(code => (0, eval)(code))
-        .catch(() => {});
-}`,
-            ], { type: 'application/javascript' });
-
-            const proxied = new OriginalWorker(URL.createObjectURL(blobSrc), options);
-
-            Object.defineProperty(proxied, 'scriptURL',
-            {
-                configurable: true,
-                enumerable: true,
-                get: () => scriptURL,
-            });
-
-            // Sync loop — use originalSetInterval to avoid recursion.
-            originalSetInterval.call(window, () =>
-            {
-                proxied.postMessage({ __sync: true, ...getTimeState() });
-            }, CONFIG.syncInterval);
-
-            return proxied;
-        }
-        catch (_)
-        {
-            return new OriginalWorker(scriptURL, options);
-        }
+        return worker;
     };
 
+    Object.setPrototypeOf(window.Worker, OriginalWorker);
     window.Worker.prototype = OriginalWorker.prototype;
     markAsNative(window.Worker);
 
@@ -732,6 +836,7 @@ ${code}
             const wrapped = wrapCode(body);
             return OrigFunc.apply(this, [...args, wrapped]);
         };
+        Object.setPrototypeOf(global.Function, OrigFunc);
         global.Function.prototype = OrigFunc.prototype;
 
         global.eval = function(code)
@@ -762,6 +867,93 @@ ${code}
             console.log(`${CONFIG.logPrefix} DevTools gap compensated: +${gap.toFixed(1)}ms`);
         }
     }, 1000);
+
+    // ─── 19. AUDIO CONTEXT TEMPORAL ALIGNMENT ─────────────────────────────────
+    
+    // Use a WeakMap to securely store the initial drift offset for each context
+    // without polluting the object instance or exposing it to page scripts.
+    const audioContextData = new WeakMap();
+
+    const patchAudioConstructor = (GlobalName) => {
+        if (!window[GlobalName]) return;
+        const OriginalCtx = window[GlobalName];
+
+        window[GlobalName] = function(...args) {
+            const ctx = new OriginalCtx(...args);
+            
+            // Capture the exact global drift (in ms) at the moment this specific context is born.
+            // _realPerfNow() and window.performance.now() (virtual) must already be defined.
+            const currentGlobalDrift = _realPerfNow() - window.performance.now();
+            
+            audioContextData.set(ctx, { creationDrift: currentGlobalDrift });
+            return ctx;
+        };
+
+        // Reuse your existing patchConstructor utility to perfectly mirror the prototype
+        Object.setPrototypeOf(window[GlobalName], OriginalCtx);
+        window[GlobalName].prototype = OriginalCtx.prototype;
+        markAsNative(window[GlobalName]);
+    };
+
+    // Patch all relevant Audio constructors
+    patchAudioConstructor('AudioContext');
+    patchAudioConstructor('webkitAudioContext');
+    patchAudioConstructor('OfflineAudioContext');
+
+    // Patch the shared prototype getter (BaseAudioContext in modern browsers)
+    const BaseCtx = window.BaseAudioContext || window.AudioContext;
+    if (BaseCtx) {
+        const origDescriptor = Object.getOwnPropertyDescriptor(BaseCtx.prototype, 'currentTime');
+        
+        if (origDescriptor && origDescriptor.get) {
+            const origGet = origDescriptor.get;
+
+            Object.defineProperty(BaseCtx.prototype, 'currentTime', {
+                configurable: true,
+                enumerable: true,
+                get: function() {
+                    const realTime = origGet.call(this); // Hardware time in seconds
+                    const state = audioContextData.get(this);
+                    
+                    if (!state) return realTime; // Safety fallback
+                    
+                    // Calculate how much the tab has drifted globally since this context was created
+                    const currentGlobalDrift = _realPerfNow() - window.performance.now();
+                    const localDriftMs = currentGlobalDrift - state.creationDrift;
+                    
+                    // AudioContext.currentTime is strictly in seconds
+                    const localDriftSec = localDriftMs / 1000;
+                    
+                    // Subtract the drift, but prevent negative time
+                    return Math.max(0, realTime - localDriftSec);
+                }
+            });
+        }
+
+        // Deep Steath: spoof getOutputTimestamp() which links Audio time to Performance time
+        if (BaseCtx.prototype.getOutputTimestamp) {
+            const origTimestamp = BaseCtx.prototype.getOutputTimestamp;
+            BaseCtx.prototype.getOutputTimestamp = function(...args) {
+                const ts = origTimestamp.apply(this, args);
+                const state = audioContextData.get(this);
+                
+                // Align the performance time directly to our spoofed virtual clock
+                if (ts.performanceTime !== undefined) {
+                    ts.performanceTime = window.performance.now(); 
+                }
+                
+                // Align the context time using the same local drift math
+                if (ts.contextTime !== undefined && state) {
+                    const currentGlobalDrift = _realPerfNow() - window.performance.now();
+                    const localDriftSec = (currentGlobalDrift - state.creationDrift) / 1000;
+                    ts.contextTime = Math.max(0, ts.contextTime - localDriftSec);
+                }
+                
+                return ts;
+            };
+            markAsNative(BaseCtx.prototype.getOutputTimestamp);
+        }
+    }
 
     // ─── 20. CLEANUP ─────────────────────────────────────────────────────────
 
