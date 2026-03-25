@@ -183,8 +183,8 @@
     // ─── 3. REAL EVENT LISTENERS (registered on raw addEventListener) ─────────
     // These must be installed *before* we hijack addEventListener so that our
     // own state-tracking is never nuked by the blacklist logic below.
-    const internalListeners = new WeakSet();
-    const listenerMap = new WeakMap();
+    const internalListeners = new Set();
+    const listenerMap = new Map();
     const _origAEL = EventTarget.prototype.addEventListener;
     const _origREL = EventTarget.prototype.removeEventListener;
 
@@ -405,7 +405,10 @@
     };
     [window, document].forEach(target =>
     {
-        blacklistedEvents.forEach(evt =>
+        new Set([
+            'visibilitychange', 'webkitvisibilitychange', 'mozvisibilitychange',
+            'blur', 'focusout', 'pagehide', 'pageshow', 'focusin', 'focus',
+        ]).forEach(evt =>
         {
             // Must use the *raw* prototype call so our killEvent isn't itself wrapped.
             rawListen(target, evt, killEvent, { capture: true });
@@ -964,6 +967,8 @@ ${code}
             heartbeat.postMessage({ type: 'clear', id });
         });
         pendingCallbacks.clear();
+        internalListeners.clear();
+        listenerMap.clear();
 
         if (channel)
         {
