@@ -4,7 +4,7 @@
 
     // ─── 0. CONFIG & STATE ────────────────────────────────────────────────────
     const CONFIG = {
-        driftFactor: 0.01, // While hidden, clock advances at 1% speed
+        driftFactor: 1.0, // While hidden, clock advances
         forceRAF: 16, // Fallback RAF interval (ms) while hidden
         logPrefix: '[FocusSpoofer]',
         debounceThreshold: 50, // ms — ignore duplicate state-change events
@@ -127,8 +127,7 @@
 
     // ─── 2. HIDDEN-STATE TRACKER ──────────────────────────────────────────────
     // Capture the *real* hidden getter before we override Document.prototype.
-    const realHiddenGetter =
-        Object.getOwnPropertyDescriptor(Document.prototype, 'hidden').get;
+    //const realHiddenGetter = Object.getOwnPropertyDescriptor(Document.prototype, 'hidden').get;
 
     const setHidden = (hidden, event = null) =>
     {
@@ -196,19 +195,33 @@
     
     const handleVisibility = (e) => {
         try {
-            const isHidden = realHiddenGetter.call(document);
-            setHidden(isHidden, e);
+            //const isHidden = realHiddenGetter.call(document);
+            setHidden(false, e);
+            
+            // Re-assert the properties in case the site tries to overwrite them
+            Object.defineProperty(document, 'visibilityState', { 
+                get: () => 'visible', 
+                configurable: true 
+            });
+            Object.defineProperty(document, 'hidden', { 
+                get: () => false, 
+                configurable: true 
+            });
+            Object.defineProperty(document, 'webkitVisibilityState', { 
+                get: () => 'visible', 
+                configurable: true 
+            });
         } catch (err) {
             // Fallback if Document prototype is heavily mangled by other scripts
             setHidden(false, e); 
         }
     };
 
-    rawListen(window, 'blur', (e) => setHidden(true, e), { capture: true, passive: true });
+    rawListen(window, 'blur', (e) => setHidden(false, e), { capture: true, passive: true });
     rawListen(window, 'focus', (e) => setHidden(false, e), { capture: true, passive: true });
-    rawListen(window, 'focusout', (e) => setHidden(true, e), { capture: true, passive: true });
+    rawListen(window, 'focusout', (e) => setHidden(false, e), { capture: true, passive: true });
     rawListen(window, 'focusin', (e) => setHidden(false, e), { capture: true, passive: true });
-    rawListen(window, 'pagehide', (e) => setHidden(true, e), { capture: true, passive: true });
+    rawListen(window, 'pagehide', (e) => setHidden(false, e), { capture: true, passive: true });
     rawListen(window, 'pageshow', (e) => setHidden(false, e), { capture: true, passive: true });
     rawListen(window, 'visibilitychange', (e) => handleVisibility(e), { capture: true, passive: true });
     rawListen(window, 'webkitvisibilitychange', (e) => handleVisibility(e), { capture: true, passive: true });
@@ -366,12 +379,12 @@
         if (!wrapped) {
             wrapped = function(event) {
                 // Ensure event identity is preserved while spoofing trust
-                try {
+                if (event && event.isTrusted === false) {
                     Object.defineProperty(event, 'isTrusted', { 
                         get: () => true,
                         configurable: true 
                     });
-                } catch(e) {}
+                }
                 return listener.apply(this, arguments);
             };
             listenerMap.set(listener, wrapped);
@@ -568,30 +581,52 @@
         try
         {
             const win = iframe.contentWindow;
-            if (!win || win.__patched) return;
-            win.__patched = true;
+            if (!win) return;
+            // CRITICAL: Check if we can actually touch the window (Same-Origin Check)
+            // Accessing win.location.href on a cross-origin frame will throw.
+            const isSameOrigin = () => {
+                try { return !!win.location.href || true; } 
+                catch(e) { return false; }
+            };
+            if (!isSameOrigin()) {
+                _log(`${CONFIG.logPrefix} Skipping Cross-Origin Frame`);
+                return;
+            }
 
+            if (win.__patched) return;
+            win.__patched = true;
+            
+            const canAccess = () => {
+                try {
+                    return !!(iframe.contentWindow && iframe.contentWindow.location.href);
+                } catch (e) {
+                    return false;
+                }
+            };
+            
             const { markAsNative: markInner } = createToStringSpoofer(win);
 
             // Give the iframe's own scripts a tick to set up before we inject.
-            originalSetTimeout.call(window, () =>
-            {
-                try
-                {
-                    markInner(win.performance.now);
-                    markInner(win.Date.now);
-                    markInner(win.requestAnimationFrame);
-                    markInner(win.cancelAnimationFrame);
-                    markInner(win.setInterval);
-                    markInner(win.clearInterval);
-                    markInner(win.requestIdleCallback);
-                    markInner(win.cancelAnimationFrame);
-                    markInner(win.Function);
-                    markInner(win.Function.prototype.toString);
-                    markInner(win.eval);
-                }
-                catch (_) {}
-            }, 100);
+            const applyPatch = () => {
+                if (!canAccess()) return;
+                markInner(win.performance.now);
+                markInner(win.Date.now);
+                markInner(win.requestAnimationFrame);
+                markInner(win.cancelAnimationFrame);
+                markInner(win.setInterval);
+                markInner(win.clearInterval);
+                markInner(win.requestIdleCallback);
+                markInner(win.cancelAnimationFrame);
+                markInner(win.Function);
+                markInner(win.Function.prototype.toString);
+                markInner(win.eval);
+                
+                patchDynamicCode(win);
+                patchAudioConstructor.call(win, 'AudioContext');
+                patchAudioConstructor.call(win, 'webkitAudioContext');
+            };
+            originalSetTimeout.call(window, applyPatch, 100);
+            iframe.addEventListener('load', applyPatch, { once: true });
 
             const sendSync = () => win.postMessage({ __sync: true, ...getTimeState() }, '*');
             const iframeSyncId = originalSetInterval.call(window, sendSync, CONFIG.syncInterval);
@@ -633,14 +668,6 @@
             rawListen(el, 'load', () => patchIframe(el));
         }
         return el;
-    };
-
-    // Hook appendChild — FIX #8: do NOT add another load listener here;
-    // it was already added by createElement hook above.
-    const originalAppendChild = Node.prototype.appendChild;
-    Node.prototype.appendChild = function(node)
-    {
-        return originalAppendChild.call(this, node);
     };
 
     // Patch already-present iframes.
@@ -867,7 +894,7 @@ ${code}
             // DevTools likely paused execution — push the internal clock forward
             // so the virtual clock doesn't think time passed while paused.
             lastRealTime += gap;
-            console.log(`${CONFIG.logPrefix} DevTools gap compensated: +${gap.toFixed(1)}ms`);
+            _log(`${CONFIG.logPrefix} DevTools gap compensated: +${gap.toFixed(1)}ms`);
         }
     }, 1000);
 
@@ -881,8 +908,11 @@ ${code}
         if (!window[GlobalName]) return;
         const OriginalCtx = window[GlobalName];
 
-        window[GlobalName] = function(...args) {
-            const ctx = new OriginalCtx(...args);
+        const ProxyCtx = function(...args) {
+            if (!(this instanceof ProxyCtx)) {
+                return Reflect.construct(OriginalCtx, args);
+            }
+            const ctx = Reflect.construct(OriginalCtx, args, ProxyCtx);
             
             // Capture the exact global drift (in ms) at the moment this specific context is born.
             // _realPerfNow() and window.performance.now() (virtual) must already be defined.
@@ -893,8 +923,11 @@ ${code}
         };
 
         // Reuse your existing patchConstructor utility to perfectly mirror the prototype
-        Object.setPrototypeOf(window[GlobalName], OriginalCtx);
-        window[GlobalName].prototype = OriginalCtx.prototype;
+        ProxyCtx.prototype = OriginalCtx.prototype;
+        ProxyCtx.prototype.constructor = ProxyCtx;
+        Object.setPrototypeOf(ProxyCtx, OriginalCtx);
+
+        window[GlobalName] = ProxyCtx;
         markAsNative(window[GlobalName]);
     };
 
