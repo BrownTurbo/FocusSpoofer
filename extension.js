@@ -977,6 +977,8 @@ ${code}
             BaseCtx.prototype.getOutputTimestamp = function(...args) {
                 const ts = origTimestamp.apply(this, args);
                 const state = audioContextData.get(this);
+
+                if (!state || !isTabActuallyHidden) return ts; // Safety fallback
                 
                 // Align the performance time directly to our spoofed virtual clock
                 if (ts.performanceTime !== undefined) {
