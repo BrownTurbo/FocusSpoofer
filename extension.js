@@ -382,7 +382,7 @@
             wrapped = function (event)
             {
                 // Ensure event identity is preserved while spoofing trust
-                if (event && event.isTrusted === false && ['click', 'mousedown', 'mouseup', 'keydown', 'keyup', 'touchstart', 'touchend']) {
+                if (event && event.isTrusted === false && ['click', 'mousedown', 'mouseup', 'keydown', 'keyup', 'touchstart', 'touchend'].includes(event.type)) {
                     const descriptor = Object.getOwnPropertyDescriptor(event, 'isTrusted');
                     // Only attempt to redefine if the property is configurable
                     if (!descriptor || descriptor.configurable) {
