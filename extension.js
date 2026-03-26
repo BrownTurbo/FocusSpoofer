@@ -127,7 +127,7 @@
 
     // ─── 2. HIDDEN-STATE TRACKER ──────────────────────────────────────────────
     // Capture the *real* hidden getter before we override Document.prototype.
-    //const realHiddenGetter = Object.getOwnPropertyDescriptor(Document.prototype, 'hidden').get;
+    const realHiddenGetter = Object.getOwnPropertyDescriptor(Document.prototype, 'hidden').get;
 
     const setHidden = (hidden, event = null) =>
     {
@@ -182,19 +182,21 @@
     // ─── 3. REAL EVENT LISTENERS (registered on raw addEventListener) ─────────
     // These must be installed *before* we hijack addEventListener so that our
     // own state-tracking is never nuked by the blacklist logic below.
+    const internalListeners = new Set();
     const listenerMap = new Map();
     const _origAEL = EventTarget.prototype.addEventListener;
     const _origREL = EventTarget.prototype.removeEventListener;
 
     // Shortcut: attach via raw prototype call
     const rawListen = (target, type, fn, opts) => {
+        internalListeners.add(type);
         return _origAEL.call(target, type, fn, opts);
     };
     
     const handleVisibility = (e) => {
         try {
-            //const isHidden = realHiddenGetter.call(document);
-            setHidden(false, e);
+            const isHidden = realHiddenGetter.call(document);
+            setHidden(isHidden, e);
             
             // Re-assert the properties in case the site tries to overwrite them
             Object.defineProperty(document, 'visibilityState', { 
@@ -215,11 +217,11 @@
         }
     };
 
-    rawListen(window, 'blur', (e) => setHidden(false, e), { capture: true, passive: true });
+    rawListen(window, 'blur', (e) => setHidden(true, e), { capture: true, passive: true });
     rawListen(window, 'focus', (e) => setHidden(false, e), { capture: true, passive: true });
-    rawListen(window, 'focusout', (e) => setHidden(false, e), { capture: true, passive: true });
+    rawListen(window, 'focusout', (e) => setHidden(true, e), { capture: true, passive: true });
     rawListen(window, 'focusin', (e) => setHidden(false, e), { capture: true, passive: true });
-    rawListen(window, 'pagehide', (e) => setHidden(false, e), { capture: true, passive: true });
+    rawListen(window, 'pagehide', (e) => setHidden(true, e), { capture: true, passive: true });
     rawListen(window, 'pageshow', (e) => setHidden(false, e), { capture: true, passive: true });
     rawListen(window, 'visibilitychange', (e) => handleVisibility(e), { capture: true, passive: true });
     rawListen(window, 'webkitvisibilitychange', (e) => handleVisibility(e), { capture: true, passive: true });
@@ -362,26 +364,40 @@
     // events are replaced with a noop that also stops propagation.
     EventTarget.prototype.addEventListener = function(type, listener, options)
     {
+        // If it's one of our "Nuke" events, we replace it with a noop
+        // but ONLY if the tab is actually hidden to avoid freezes.
+        if (internalListeners.has(type) && isTabActuallyHidden)
+        {
+            const noop = (e) =>
+            {
+                e.stopImmediatePropagation();
+                e.stopPropagation();
+            };
+            return _origAEL.call(this, type, noop, options);
+        }
+        
         // For all other events, create a proxy to spoof isTrusted or other props if needed
         let wrapped = listenerMap.get(listener);
         if (!wrapped) {
             wrapped = function (event)
             {
                 // Ensure event identity is preserved while spoofing trust
-                if (event && event.isTrusted === false) {
-                    Object.defineProperty(event, 'isTrusted', { 
-                        get: () => true,
-                        configurable: true 
-                    });
+                if (event && event.isTrusted === false && ['click', 'mousedown', 'mouseup', 'keydown', 'keyup', 'touchstart', 'touchend']) {
+                    const descriptor = Object.getOwnPropertyDescriptor(event, 'isTrusted');
+                    // Only attempt to redefine if the property is configurable
+                    if (!descriptor || descriptor.configurable) {
+                        Object.defineProperty(event, 'isTrusted', { 
+                            value: true, 
+                            configurable: true,
+                            writable: false 
+                        });
+                    }
                 }
                 return listener.call(this, event);
             };
             listenerMap.set(listener, wrapped);
         }
-        if (type === 'visibilitychange' || type === 'blur' || type === 'focus') {
-            return _origAEL.call(this, type, wrapped, options);
-        }
-        return _origAEL.call(this, type, listener, options);
+        return _origAEL.call(this, type, wrapped, options);
     };
 
     EventTarget.prototype.removeEventListener = function(type, listener, options) {
@@ -399,6 +415,8 @@
     // Belt-and-suspenders: raw capture listeners that kill the event *early*.
     const killEvent = (e) =>
     {
+        //if (!isTabActuallyHidden) return;
+
         e.stopImmediatePropagation();
         e.stopPropagation();
         _log(`${CONFIG.logPrefix} Nuked ${e.type}`);
@@ -938,7 +956,7 @@ ${code}
                     const realTime = origGet.call(this); // Hardware time in seconds
                     const state = audioContextData.get(this);
                     
-                    if (!state) return realTime; // Safety fallback
+                    if (!state || !isTabActuallyHidden) return realTime; // Safety fallback
                     
                     // Calculate how much the tab has drifted globally since this context was created
                     const currentGlobalDrift = _realPerfNow() - window.performance.now();
@@ -987,6 +1005,7 @@ ${code}
             heartbeat.postMessage({ type: 'clear', id });
         });
         pendingCallbacks.clear();
+        internalListeners.clear();
         listenerMap.clear();
 
         if (channel)
