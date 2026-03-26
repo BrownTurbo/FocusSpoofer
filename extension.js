@@ -182,14 +182,12 @@
     // ─── 3. REAL EVENT LISTENERS (registered on raw addEventListener) ─────────
     // These must be installed *before* we hijack addEventListener so that our
     // own state-tracking is never nuked by the blacklist logic below.
-    const internalListeners = new Set();
     const listenerMap = new Map();
     const _origAEL = EventTarget.prototype.addEventListener;
     const _origREL = EventTarget.prototype.removeEventListener;
 
     // Shortcut: attach via raw prototype call
     const rawListen = (target, type, fn, opts) => {
-        internalListeners.add(type);
         return _origAEL.call(target, type, fn, opts);
     };
     
@@ -364,20 +362,11 @@
     // events are replaced with a noop that also stops propagation.
     EventTarget.prototype.addEventListener = function(type, listener, options)
     {
-        if (internalListeners.has(type))
-        {
-            const noop = (e) =>
-            {
-                e.stopImmediatePropagation();
-                e.stopPropagation();
-            };
-            return _origAEL.call(this, type, noop, options);
-        }
-        
         // For all other events, create a proxy to spoof isTrusted or other props if needed
         let wrapped = listenerMap.get(listener);
         if (!wrapped) {
-            wrapped = function(event) {
+            wrapped = function (event)
+            {
                 // Ensure event identity is preserved while spoofing trust
                 if (event && event.isTrusted === false) {
                     Object.defineProperty(event, 'isTrusted', { 
@@ -385,19 +374,17 @@
                         configurable: true 
                     });
                 }
-                return listener.apply(this, arguments);
+                return listener.call(this, event);
             };
             listenerMap.set(listener, wrapped);
         }
-        return _origAEL.apply(this, arguments);
+        if (type === 'visibilitychange' || type === 'blur' || type === 'focus') {
+            return _origAEL.call(this, type, wrapped, options);
+        }
+        return _origAEL.call(this, type, listener, options);
     };
 
     EventTarget.prototype.removeEventListener = function(type, listener, options) {
-        // If it's one of our internal engine listeners, remove it directly
-        if (internalListeners.has(type)) {
-            return _origREL.apply(this, arguments);
-        }
-
         // Look up our proxy/noop. If the site calls remove(OriginalFunc), 
         // we must call _origREL(WrappedFunc/Noop) for the browser to find it.
         const wrapped = listenerMap.get(listener);
@@ -1000,7 +987,6 @@ ${code}
             heartbeat.postMessage({ type: 'clear', id });
         });
         pendingCallbacks.clear();
-        internalListeners.clear();
         listenerMap.clear();
 
         if (channel)
