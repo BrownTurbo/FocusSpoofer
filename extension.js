@@ -73,13 +73,6 @@
             SAFE_MODE = evaluateInitSafeModeCheckPresence();
         };
 
-        // Initialize as soon as possible, or fallback to DOMContentLoaded
-        if (document.documentElement) {
-            initInitSafeModeCheckObserver();
-        } else {
-            rawListen(window, 'DOMContentLoaded', initInitSafeModeCheckObserver, { once: true });
-        }
-
         // ─── CROSS-TAB LEADER ELECTION ────────────────────────────────────────────
         const tabId = Math.random().toString(36).slice(2);
         let isLeader = true; // assume leader until a rival claims it
@@ -168,7 +161,7 @@
         // ...
         const isMediaPlaying = () => {
             const media = document.querySelectorAll('video, audio');
-            return Array.from(media).some(m => !m.paused);
+            return Array.from(media).some(m => !!(el.currentTime > 0 && !el.paused && !el.ended && el.readyState > 2));
         };
 
         // Time-only sync — used for ALL external sources (BroadcastChannel, iframes,
@@ -282,6 +275,14 @@
         rawListen(window, 'visibilitychange', (e) => handleVisibility(e), { capture: true, passive: true });
         rawListen(window, 'webkitvisibilitychange', (e) => handleVisibility(e), { capture: true, passive: true });
         rawListen(window, 'mozvisibilitychange', (e) => handleVisibility(e), { capture: true, passive: true });
+
+        // ...
+        // Initialize as soon as possible, or fallback to DOMContentLoaded
+        if (document.documentElement) {
+            initInitSafeModeCheckObserver();
+        } else {
+            rawListen(window, 'DOMContentLoaded', initInitSafeModeCheckObserver, { once: true });
+        }
 
         // ─── 4. OVERRIDE performance.now ──────────────────────────────────────────
         const originalPerfNow = window.performance.now;
