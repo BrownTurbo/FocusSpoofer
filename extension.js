@@ -138,6 +138,12 @@
             });
         }
 
+        // ...
+        const isMediaPlaying = () => {
+            const media = document.querySelectorAll('video, audio');
+            return Array.from(media).some(m => !!(m.currentTime > 0 && !m.paused && !m.ended && m.readyState > 2));
+        };
+
         // ─── 1. VIRTUAL CLOCK ─────────────────────────────────────────────────────
         const updateVirtualClock = () =>
         {
@@ -156,12 +162,6 @@
             if (!state || typeof state.t !== 'number') return;
             virtualTime = state.t;
             isTabActuallyHidden = !!state.h;
-        };
-        
-        // ...
-        const isMediaPlaying = () => {
-            const media = document.querySelectorAll('video, audio');
-            return Array.from(media).some(m => !!(el.currentTime > 0 && !el.paused && !el.ended && el.readyState > 2));
         };
 
         // Time-only sync — used for ALL external sources (BroadcastChannel, iframes,
