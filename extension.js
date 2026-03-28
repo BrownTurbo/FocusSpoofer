@@ -34,36 +34,56 @@
         let SAFE_MODE = false;
 
         const evaluateInitSafeModeCheckPresence = () => {
+            let safeMode = false;
             // 1. Direct Frame Check: Are we executing inside the Cloudflare challenge iframe?
-            if (window.location.hostname.includes('challenges.cloudflare.com')) return true;
+            if (window.location.hostname.includes('challenges.cloudflare.com')) safeMode = true;
             
             // 2. Global Variable Check: Has Turnstile initialized?
-            if (window.turnstile || window._cf_chl_opt) return true;
+            if (window.turnstile || window._cf_chl_opt) safeMode = true;
 
             // 3. DOM Fingerprint Check: Look for challenge wrappers or Turnstile iframes
             if (document.body) {
                 const cfMarkers = document.querySelectorAll(
                     '#cf-please-wait, #challenge-running, #cf-spinner-allow-5-secs, [id^="cf-turnstile"], iframe[src*="challenges.cloudflare.com"]'
                 );
-                if (cfMarkers.length > 0) return true;
+                if (cfMarkers.length > 0) safeMode = true;
             }
 
+            // 4. ...
             if (window.__CF$cv$params || window.__cfBeacon || window.__cf_chl_opt ||
                 Array.from(document.scripts).some(s =>
                     s.src.includes('/cdn-cgi/') ||
                     s.src.includes('challenge-platform')
                 ) ||
-                document.querySelector('#cf-challenge-running') || document.querySelector('[data-cf-settings]')) return true;
-            return false;
+                document.querySelector('#cf-challenge-running') || document.querySelector('[data-cf-settings]')) safeMode = true;
+                
+            // 5. Check for CF challenge script tags or injected code
+            for (const script of document.querySelectorAll('script')) {
+                if ((script.getAttribute('src') || '').includes('/cdn-cgi/challenge-platform/') || (script.textContent || '').includes('__CF$cv$params')) safeMode = true;
+            }
+            
+            // 6. ...
+            const CFcookies = document.cookie || '';
+            if (CFcookies.includes('__cf_bm=') || CFcookies.includes('cf_clearance=')) safeMode = true;
+            return safeMode;
         };
 
         const initInitSafeModeCheckObserver = () => {
-            const observer = new MutationObserver(() => {
+            const observer = new MutationObserver((muts) => {
                 const currentlyDetected = evaluateInitSafeModeCheckPresence();
-                if (currentlyDetected !== SAFE_MODE) {
-                    SAFE_MODE = currentlyDetected;
-                    _log(`${CONFIG.logPrefix} SAFE Mode is ${SAFE_MODE ? 'ENABLED' : 'DISABLED'}`);
-                }
+                if (currentlyDetected !== SAFE_MODE) SAFE_MODE = currentlyDetected;
+                muts.forEach(m => {
+                    m.addedNodes.forEach(node => {
+                        // 1. Ensure the node is an Element (nodeType 1)
+                        if (node.nodeType !== 1) return;
+
+                        // 2. Check for Cloudflare Invisible Iframe traps
+                        if (node.tagName === 'IFRAME' && ((node.width == 1 && node.height == 1) || (node.style.visibility==='hidden' && node.style.height==='1px'))) SAFE_MODE = true;
+                        
+                        // 3. Check for Cloudflare Error or Wrapper IDs/Classes
+                        if (node.id === 'cf-wrapper' || (node.classList && node.classList.contains('cf-error-details'))) SAFE_MODE = true;
+                    });
+                });
             });
 
             // Attach to documentElement to catch head/body injections as early as possible
@@ -72,6 +92,17 @@
             // Run initial check
             SAFE_MODE = evaluateInitSafeModeCheckPresence();
         };
+
+        // ...
+        const origFetch = window.fetch;
+        window.fetch = async function(input, init) {
+            const response = await origFetch(input, init);
+            const header = response.headers.get('cf-mitigated');
+            if (header === 'challenge') SAFE_MODE = true;
+            return response;
+        };
+        Object.setPrototypeOf(window.fetch, origFetch);
+        window.fetch.prototype = origFetch.prototype;
 
         // ─── CROSS-TAB LEADER ELECTION ────────────────────────────────────────────
         const tabId = Math.random().toString(36).slice(2);
@@ -122,6 +153,8 @@
                 };
 
                 // Spoof the [native code] string for this specific method
+                Object.setPrototypeOf(console[method], originalMethod);
+                console[method].prototype = originalMethod.prototype;
                 markAsNative(console[method]);
             }
         });
@@ -295,6 +328,8 @@
             updateVirtualClock();
             return virtualTime;
         };
+        Object.setPrototypeOf(window.performance.now, originalPerfNow);
+        window.performance.now.prototype = originalPerfNow.prototype;
         markAsNative(window.performance.now);
 
         // ─── 5. OVERRIDE Date.now & Date constructor ──────────────────────────────
@@ -308,6 +343,8 @@
             }
             return Math.floor(epochOffset + window.performance.now());
         };
+        Object.setPrototypeOf(window.Date.now, OriginalDate);
+        window.Date.now.prototype = OriginalDate.prototype;
         markAsNative(window.Date.now);
 
         // (We use _realDateNow internally; window.Date.now is the public override.)
@@ -425,6 +462,8 @@
             if (SAFE_MODE || !isTabActuallyHidden) return origHasFocus.call(this);
             return true; // Lie and say we still have focus
         };
+        Object.setPrototypeOf(document.hasFocus, origHasFocus);
+        document.hasFocus.prototype = origHasFocus.prototype;
         markAsNative(document.hasFocus);
 
         // ─── 8. EVENT INTERCEPTION ────────────────────────────────────────────────
@@ -487,7 +526,11 @@
             return _origREL.call(this, type, targetListener, options);
         };
 
+        Object.setPrototypeOf(EventTarget.prototype.addEventListener, _origAEL);
+        EventTarget.prototype.addEventListener.prototype = _origAEL.prototype;
         markAsNative(EventTarget.prototype.addEventListener);
+        Object.setPrototypeOf(EventTarget.prototype.removeEventListener, _origREL);
+        EventTarget.prototype.removeEventListener.prototype = _origREL.prototype;        
         markAsNative(EventTarget.prototype.removeEventListener);
 
         // Belt-and-suspenders: raw capture listeners that kill the event *early*.
@@ -566,6 +609,8 @@
             }
             return originalSetInterval.apply(this, [callback, delay, ...args]);
         };
+        Object.setPrototypeOf(window.setInterval, originalSetInterval);
+        window.setInterval.prototype = originalSetInterval.prototype;  
         markAsNative(window.setInterval);
         window.clearInterval = function(id)
         {
@@ -580,6 +625,8 @@
                 originalClearInterval(id);
             }
         };
+        Object.setPrototypeOf(window.clearInterval, originalClearInterval);
+        window.clearInterval.prototype = originalClearInterval.prototype; 
         markAsNative(window.clearInterval);
 
         // ─── 11. requestAnimationFrame / cancelAnimationFrame override ────────────
@@ -602,6 +649,8 @@
             }
             return originalRAF(wrapped);
         };
+        Object.setPrototypeOf(window.requestAnimationFrame, originalRAF);
+        window.requestAnimationFrame.prototype = originalRAF.prototype; 
         markAsNative(window.requestAnimationFrame);
         window.cancelAnimationFrame = function(id)
         {
@@ -616,6 +665,8 @@
                 originalCAF(id);
             }
         };
+        Object.setPrototypeOf(window.cancelAnimationFrame, originalCAF);
+        window.cancelAnimationFrame.prototype = originalCAF.prototype; 
         markAsNative(window.cancelAnimationFrame);
 
         // ─── 12. requestIdleCallback / cancelIdleCallback override ───────────────
@@ -636,6 +687,8 @@
             heartbeat.postMessage({ type: 'set', id, delay, isTimeout: true });
             return id;
         };
+        Object.setPrototypeOf(window.requestIdleCallback, originalRIC);
+        window.requestIdleCallback.prototype = originalRIC.prototype; 
         markAsNative(window.requestIdleCallback);
         window.cancelIdleCallback = function(id)
         {
@@ -650,10 +703,9 @@
                 originalClearTimeout(id);
             }
         };
+        Object.setPrototypeOf(window.cancelIdleCallback, originalCIC);
+        window.cancelIdleCallback.prototype = originalCIC.prototype; 
         markAsNative(window.cancelIdleCallback);
-
-        markAsNative(window.Worker);
-        markAsNative(window.eval);
 
         // ─── 14. IFRAME PATCHING ──────────────────────────────────────────────────
         const patchedIframes = new WeakSet();
@@ -705,7 +757,6 @@
                     markInner(win.cancelAnimationFrame);
                     markInner(win.Function);
                     markInner(win.Function.prototype.toString);
-                    markInner(win.eval);
                     
                     patchDynamicCode(win);
                     patchAudioConstructor.call(win, 'AudioContext');
@@ -756,6 +807,8 @@
             }
             return el;
         };
+        Object.setPrototypeOf(document.createElement, originalCreateElement);
+        document.createElement.prototype = originalCreateElement.prototype; 
         markAsNative(document.createElement);
 
         // Patch already-present iframes.
@@ -799,8 +852,10 @@
                 });
                 return callback(spoofedEntries, observer);
             };
-            return new OriginalIO(wrappedCallback, options);
+            return Reflect.construct(OriginalIO, [wrappedCallback, options]);
         };
+        Object.setPrototypeOf(window.IntersectionObserver, OriginalIO);
+        window.IntersectionObserver.prototype = OriginalIO.prototype; 
         markAsNative(window.IntersectionObserver);
 
         // ─── 15. WORKER PATCHING ─────────────────────────────────────────────────
@@ -1072,7 +1127,7 @@
                     const ts = origTimestamp.apply(this, args);
                     const state = audioContextData.get(this);
                     
-                    if (!state || !isTabActuallyHidden) return ts; // Safety fallback
+                    if (!state || isMediaPlaying() || !isTabActuallyHidden) return ts; // Safety fallback
                     
                     // Align the performance time directly to our spoofed virtual clock
                     if (ts.performanceTime !== undefined) {
