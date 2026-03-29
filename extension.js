@@ -4,7 +4,7 @@
 
         // ─── 0. CONFIG & STATE ────────────────────────────────────────────────────
         const CONFIG = {
-            driftFactor: 1.0, // While hidden, clock advances
+            driftFactor: 0.01, // While hidden, clock advances
             forceRAF: 16, // Fallback RAF interval (ms) while hidden
             logPrefix: '[FocusSpoofer]',
             debounceThreshold: 50, // ms — ignore duplicate state-change events
@@ -95,14 +95,17 @@
 
         // ...
         const origFetch = window.fetch;
-        window.fetch = async function(input, init) {
-            const response = await origFetch(input, init);
-            const header = response.headers.get('cf-mitigated');
-            if (header === 'challenge') SAFE_MODE = true;
-            return response;
-        };
-        Object.setPrototypeOf(window.fetch, origFetch);
-        window.fetch.prototype = origFetch.prototype;
+        if (typeof origFetch !== 'undefined')
+        {
+            window.fetch = async function(input, init) {
+                const response = await origFetch(input, init);
+                const header = response.headers.get('cf-mitigated');
+                if (header === 'challenge') SAFE_MODE = true;
+                return response;
+            };
+            Object.setPrototypeOf(window.fetch, origFetch);
+            window.fetch.prototype = origFetch.prototype;
+        }
 
         // ─── CROSS-TAB LEADER ELECTION ────────────────────────────────────────────
         const tabId = Math.random().toString(36).slice(2);
@@ -158,18 +161,6 @@
                 markAsNative(console[method]);
             }
         });
-
-        // Spoof console.memory — Chrome exposes this; Firefox doesn't.
-        // Sites probe it to fingerprint the browser/runtime environment.
-        if(!SAFE_MODE && isTabActuallyHidden && typeof console !== 'undefined')
-        {
-            Object.defineProperty(console, 'memory',
-            {
-                configurable: true,
-                enumerable: true,
-                get: () => undefined,
-            });
-        }
 
         // ...
         const isMediaPlaying = () => {
@@ -319,33 +310,39 @@
 
         // ─── 4. OVERRIDE performance.now ──────────────────────────────────────────
         const originalPerfNow = window.performance.now;
-        window.performance.now = function()
+        if (typeof originalPerfNow !== 'undefined')
         {
-            if (SAFE_MODE || isMediaPlaying() || !isTabActuallyHidden) {
-                return originalPerfNow.call(this);
-            }
+            window.performance.now = function()
+            {
+                if (SAFE_MODE || isMediaPlaying() || !isTabActuallyHidden) {
+                    return originalPerfNow.call(this);
+                }
 
-            updateVirtualClock();
-            return virtualTime;
-        };
-        Object.setPrototypeOf(window.performance.now, originalPerfNow);
-        window.performance.now.prototype = originalPerfNow.prototype;
-        markAsNative(window.performance.now);
+                updateVirtualClock();
+                return virtualTime;
+            };
+            Object.setPrototypeOf(window.performance.now, originalPerfNow);
+            window.performance.now.prototype = originalPerfNow.prototype;
+            markAsNative(window.performance.now);
+        }
 
         // ─── 5. OVERRIDE Date.now & Date constructor ──────────────────────────────
         const OriginalDate = window.Date; // capture before we replace it
 
         // Override the static .now() first (before MockDate copies it)
-        window.Date.now = function()
+        if (typeof OriginalDate !== 'undefined')
         {
-            if (SAFE_MODE || !isTabActuallyHidden) {
-                return _realDateNow(); 
-            }
-            return Math.floor(epochOffset + window.performance.now());
-        };
-        Object.setPrototypeOf(window.Date.now, OriginalDate);
-        window.Date.now.prototype = OriginalDate.prototype;
-        markAsNative(window.Date.now);
+            window.Date.now = function()
+            {
+                if (SAFE_MODE || !isTabActuallyHidden) {
+                    return _realDateNow(); 
+                }
+                return Math.floor(epochOffset + window.performance.now());
+            };
+            Object.setPrototypeOf(window.Date.now, OriginalDate);
+            window.Date.now.prototype = OriginalDate.prototype;
+            markAsNative(window.Date.now);
+        }
 
         // (We use _realDateNow internally; window.Date.now is the public override.)
 
@@ -426,7 +423,7 @@
         const patchActiveElement = (Proto) => {
             const originalDescriptor = Object.getOwnPropertyDescriptor(Proto, 'activeElement');
             if (!originalDescriptor || !originalDescriptor.get) return;
-            if (SAFE_MODE || !isTabActuallyHidden) return;
+            if (SAFE_MODE) return;
 
             Object.defineProperty(Proto, 'activeElement', {
                 configurable: true,
@@ -458,80 +455,88 @@
         }
 
         const origHasFocus = document.hasFocus;
-        document.hasFocus = function() {
-            if (SAFE_MODE || !isTabActuallyHidden) return origHasFocus.call(this);
-            return true; // Lie and say we still have focus
-        };
-        Object.setPrototypeOf(document.hasFocus, origHasFocus);
-        document.hasFocus.prototype = origHasFocus.prototype;
-        markAsNative(document.hasFocus);
+        if (typeof origHasFocus !== 'undefined')
+        {
+            const hasFocusSpoofed = function() {
+                if (SAFE_MODE || !isTabActuallyHidden) return origHasFocus.call(this);
+                return true; // Lie and say we still have focus
+            };
+            Object.setPrototypeOf(hasFocusSpoofed, origHasFocus);
+            Object.defineProperty(Document.prototype, 'hasFocus', { configurable: true, writable: true, value: hasFocusSpoofed });
+            Object.defineProperty(document, 'hasFocus', { configurable: true, writable: true, value: hasFocusSpoofed });
+            markAsNative(document.hasFocus);
+        }
 
         // ─── 8. EVENT INTERCEPTION ────────────────────────────────────────────────
         // Hijack addEventListener — site-registered handlers for blacklisted
         // events are replaced with a noop that also stops propagation.
-        EventTarget.prototype.addEventListener = function(type, listener, options)
+        if (typeof _origAEL !== 'undefined')
         {
-            // If it's one of our "Nuke" events, we replace it with a noop
-            // but ONLY if the tab is actually hidden to avoid freezes.
-            if (internalListeners.has(type) && isTabActuallyHidden)
+            EventTarget.prototype.addEventListener = function(type, listener, options)
             {
-                const noop = (e) =>
+                // If it's one of our "Nuke" events, we replace it with a noop
+                // but ONLY if the tab is actually hidden to avoid freezes.
+                if (internalListeners.has(type) && isTabActuallyHidden)
                 {
-                    e.stopImmediatePropagation();
-                    e.stopPropagation();
-                };
-                return _origAEL.call(this, type, noop, options);
-            }
-            
-            // NEVER touch real user interaction events
-            if (['click', 'mousedown', 'mouseup', 'keydown', 'keyup', 'touchstart', 'touchend'].includes(type)) {
-                return _origAEL.call(this, type, listener, options);
-            }
-            
-            // NEVER interact with events when in SAFE Mode or TAB is really visible...
-            if (SAFE_MODE || !isTabActuallyHidden) {
-                return _origAEL.call(this, type, listener, options);
-            }
-            
-            // For all other events, create a proxy to spoof isTrusted or other props if needed
-            let wrapped = listenerMap.get(listener);
-            if (!wrapped) {
-                wrapped = function (event)
-                {
-                    // Ensure event identity is preserved while spoofing trust
-                    if (event && event.isTrusted === false) {
-                        const descriptor = Object.getOwnPropertyDescriptor(event, 'isTrusted');
-                        // Only attempt to redefine if the property is configurable
-                        if (!descriptor || descriptor.configurable) {
-                            Object.defineProperty(event, 'isTrusted', { 
-                                value: true, 
-                                configurable: true,
-                                writable: false 
-                            });
+                    const noop = (e) =>
+                    {
+                        e.stopImmediatePropagation();
+                        e.stopPropagation();
+                    };
+                    return _origAEL.call(this, type, noop, options);
+                }
+                
+                // NEVER touch real user interaction events
+                if (['click', 'mousedown', 'mouseup', 'keydown', 'keyup', 'touchstart', 'touchend'].includes(type)) {
+                    return _origAEL.call(this, type, listener, options);
+                }
+                
+                // NEVER interact with events when in SAFE Mode or TAB is really visible...
+                if (SAFE_MODE || !isTabActuallyHidden) {
+                    return _origAEL.call(this, type, listener, options);
+                }
+                
+                // For all other events, create a proxy to spoof isTrusted or other props if needed
+                let wrapped = listenerMap.get(listener);
+                if (!wrapped) {
+                    wrapped = function (event)
+                    {
+                        // Ensure event identity is preserved while spoofing trust
+                        if (event && event.isTrusted === false) {
+                            const descriptor = Object.getOwnPropertyDescriptor(event, 'isTrusted');
+                            // Only attempt to redefine if the property is configurable
+                            if (!descriptor || descriptor.configurable) {
+                                Object.defineProperty(event, 'isTrusted', { 
+                                    value: true, 
+                                    configurable: true,
+                                    writable: false 
+                                });
+                            }
                         }
-                    }
-                    return listener.call(this, event);
-                };
-                listenerMap.set(listener, wrapped);
-            }
-            return _origAEL.call(this, type, wrapped, options);
-        };
+                        return listener.call(this, event);
+                    };
+                    listenerMap.set(listener, wrapped);
+                }
+                return _origAEL.call(this, type, wrapped, options);
+            };
+            Object.setPrototypeOf(EventTarget.prototype.addEventListener, _origAEL);
+            EventTarget.prototype.addEventListener.prototype = _origAEL.prototype;
+            markAsNative(EventTarget.prototype.addEventListener);
+        }
+        if (typeof _origREL !== 'undefined')
+        {
+            EventTarget.prototype.removeEventListener = function(type, listener, options) {
+                // Look up our proxy/noop. If the site calls remove(OriginalFunc), 
+                // we must call _origREL(WrappedFunc/Noop) for the browser to find it.
+                const wrapped = listenerMap.get(listener);
+                const targetListener = wrapped || listener;
 
-        EventTarget.prototype.removeEventListener = function(type, listener, options) {
-            // Look up our proxy/noop. If the site calls remove(OriginalFunc), 
-            // we must call _origREL(WrappedFunc/Noop) for the browser to find it.
-            const wrapped = listenerMap.get(listener);
-            const targetListener = wrapped || listener;
-
-            return _origREL.call(this, type, targetListener, options);
-        };
-
-        Object.setPrototypeOf(EventTarget.prototype.addEventListener, _origAEL);
-        EventTarget.prototype.addEventListener.prototype = _origAEL.prototype;
-        markAsNative(EventTarget.prototype.addEventListener);
-        Object.setPrototypeOf(EventTarget.prototype.removeEventListener, _origREL);
-        EventTarget.prototype.removeEventListener.prototype = _origREL.prototype;        
-        markAsNative(EventTarget.prototype.removeEventListener);
+                return _origREL.call(this, type, targetListener, options);
+            };
+            Object.setPrototypeOf(EventTarget.prototype.removeEventListener, _origREL);
+            EventTarget.prototype.removeEventListener.prototype = _origREL.prototype;        
+            markAsNative(EventTarget.prototype.removeEventListener);
+        }
 
         // Belt-and-suspenders: raw capture listeners that kill the event *early*.
         const killEvent = (e) =>
@@ -596,116 +601,129 @@
         const originalClearInterval = window.clearInterval;
         const originalSetTimeout = window.setTimeout;
         const originalClearTimeout = window.clearTimeout;
-
-        window.setInterval = function(callback, delay, ...args)
+        if (typeof originalSetInterval !== 'undefined')
         {
-            if(SAFE_MODE || !isTabActuallyHidden) return originalSetInterval.apply(this, [callback, delay, ...args]);
-            if (typeof delay === 'number' && delay < 1000)
+            window.setInterval = function(callback, delay, ...args)
             {
-                const id = ++callbackId;
-                pendingCallbacks.set(id, { fn: () => callback(...args), oneShot: false });
-                heartbeat.postMessage({ type: 'set', id, delay });
-                return id;
-            }
-            return originalSetInterval.apply(this, [callback, delay, ...args]);
-        };
-        Object.setPrototypeOf(window.setInterval, originalSetInterval);
-        window.setInterval.prototype = originalSetInterval.prototype;  
-        markAsNative(window.setInterval);
-        window.clearInterval = function(id)
+                if(SAFE_MODE || !isTabActuallyHidden) return originalSetInterval.apply(this, [callback, delay, ...args]);
+                if (typeof delay === 'number' && delay < 1000)
+                {
+                    const id = ++callbackId;
+                    pendingCallbacks.set(id, { fn: () => callback(...args), oneShot: false });
+                    heartbeat.postMessage({ type: 'set', id, delay });
+                    return id;
+                }
+                return originalSetInterval.apply(this, [callback, delay, ...args]);
+            };
+            Object.setPrototypeOf(window.setInterval, originalSetInterval);
+            window.setInterval.prototype = originalSetInterval.prototype;  
+            markAsNative(window.setInterval);
+        }
+        if (typeof originalClearInterval !== 'undefined')
         {
-            if(SAFE_MODE || !isTabActuallyHidden) return originalClearInterval.apply(this, [id]);
-            if (pendingCallbacks.has(id))
+            window.clearInterval = function(id)
             {
-                heartbeat.postMessage({ type: 'clear', id });
-                pendingCallbacks.delete(id);
-            }
-            else
-            {
-                originalClearInterval(id);
-            }
-        };
-        Object.setPrototypeOf(window.clearInterval, originalClearInterval);
-        window.clearInterval.prototype = originalClearInterval.prototype; 
-        markAsNative(window.clearInterval);
+                if(SAFE_MODE || !isTabActuallyHidden) return originalClearInterval.apply(this, [id]);
+                if (pendingCallbacks.has(id))
+                {
+                    heartbeat.postMessage({ type: 'clear', id });
+                    pendingCallbacks.delete(id);
+                }
+                else
+                {
+                    originalClearInterval(id);
+                }
+            };
+            Object.setPrototypeOf(window.clearInterval, originalClearInterval);
+            window.clearInterval.prototype = originalClearInterval.prototype; 
+            markAsNative(window.clearInterval);
+        }
 
         // ─── 11. requestAnimationFrame / cancelAnimationFrame override ────────────
         const originalRAF = window.requestAnimationFrame;
         const originalCAF = window.cancelAnimationFrame;
 
-        window.requestAnimationFrame = (callback) =>
+        if (typeof originalRAF !== 'undefined')
         {
-            if(SAFE_MODE || !isTabActuallyHidden) return originalRAF.apply(this, [callback]);
-            const wrapped = () => callback(window.performance.now());
-
-            if (isTabActuallyHidden)
+            window.requestAnimationFrame = (callback) =>
             {
+                if(SAFE_MODE || !isTabActuallyHidden) return originalRAF.call(window, callback);
+                const wrapped = () => callback(window.performance.now());
+
                 const id = ++callbackId;
                 // oneShot:true — RAF fires exactly once; heartbeat.onmessage will
                 // auto-delete after the callback runs, preventing a memory leak.
                 pendingCallbacks.set(id, { fn: wrapped, oneShot: true });
                 heartbeat.postMessage({ type: 'set', id, delay: CONFIG.forceRAF, isTimeout: true });
                 return id;
-            }
-            return originalRAF(wrapped);
-        };
-        Object.setPrototypeOf(window.requestAnimationFrame, originalRAF);
-        window.requestAnimationFrame.prototype = originalRAF.prototype; 
-        markAsNative(window.requestAnimationFrame);
-        window.cancelAnimationFrame = function(id)
+            };
+            Object.setPrototypeOf(window.requestAnimationFrame, originalRAF);
+            window.requestAnimationFrame.prototype = originalRAF.prototype; 
+            markAsNative(window.requestAnimationFrame);
+        }
+        if (typeof originalCAF !== 'undefined')
         {
-            if(SAFE_MODE || !isTabActuallyHidden) return originalCAF.apply(this, [id]);
-            if (pendingCallbacks.has(id))
+            window.cancelAnimationFrame = function(id)
             {
-                heartbeat.postMessage({ type: 'clear', id });
-                pendingCallbacks.delete(id);
-            }
-            else
-            {
-                originalCAF(id);
-            }
-        };
-        Object.setPrototypeOf(window.cancelAnimationFrame, originalCAF);
-        window.cancelAnimationFrame.prototype = originalCAF.prototype; 
-        markAsNative(window.cancelAnimationFrame);
+                if(SAFE_MODE || !isTabActuallyHidden) return originalCAF.apply(this, [id]);
+                if (pendingCallbacks.has(id))
+                {
+                    heartbeat.postMessage({ type: 'clear', id });
+                    pendingCallbacks.delete(id);
+                }
+                else
+                {
+                    originalCAF(id);
+                }
+            };
+            Object.setPrototypeOf(window.cancelAnimationFrame, originalCAF);
+            window.cancelAnimationFrame.prototype = originalCAF.prototype; 
+            markAsNative(window.cancelAnimationFrame);
+        }
 
         // ─── 12. requestIdleCallback / cancelIdleCallback override ───────────────
         const originalRIC = window.requestIdleCallback;
         const originalCIC = window.cancelIdleCallback;
 
-        window.requestIdleCallback = function(callback, opts)
+        if (typeof originalRIC !== 'undefined')
         {
-            if(SAFE_MODE || !isTabActuallyHidden) return originalRIC.apply(this, [callback, opts]);
-            const delay = (opts && opts.timeout) ? Math.min(opts.timeout, 50) : 1;
-            const id = ++callbackId;
-            // oneShot:true — idle callbacks fire once per request, same as RAF.
-            pendingCallbacks.set(id,
+            window.requestIdleCallback = function(callback, opts)
             {
-                fn: () => callback({ didTimeout: false, timeRemaining: () => 50 }),
-                oneShot: true,
-            });
-            heartbeat.postMessage({ type: 'set', id, delay, isTimeout: true });
-            return id;
-        };
-        Object.setPrototypeOf(window.requestIdleCallback, originalRIC);
-        window.requestIdleCallback.prototype = originalRIC.prototype; 
-        markAsNative(window.requestIdleCallback);
-        window.cancelIdleCallback = function(id)
+                if(SAFE_MODE || !isTabActuallyHidden) return originalRIC.apply(this, [callback, opts]);
+                const delay = (opts && opts.timeout) ? Math.min(opts.timeout, 50) : 1;
+                const id = ++callbackId;
+                // oneShot:true — idle callbacks fire once per request, same as RAF.
+                pendingCallbacks.set(id,
+                {
+                    fn: () => callback({ didTimeout: false, timeRemaining: () => 50 }),
+                    oneShot: true,
+                });
+                heartbeat.postMessage({ type: 'set', id, delay, isTimeout: true });
+                return id;
+            };
+            Object.setPrototypeOf(window.requestIdleCallback, originalRIC);
+            window.requestIdleCallback.prototype = originalRIC.prototype; 
+            markAsNative(window.requestIdleCallback);
+        }
+        if (typeof originalCIC !== 'undefined')
         {
-            if(SAFE_MODE || !isTabActuallyHidden) return originalCIC.apply(this, [id]);
-            if (pendingCallbacks.has(id))
+            window.cancelIdleCallback = function(id)
             {
-                heartbeat.postMessage({ type: 'clear', id });
-                pendingCallbacks.delete(id);
-            }
-            else
-            {
-                originalClearTimeout(id);
-            }
-        };
-        Object.setPrototypeOf(window.cancelIdleCallback, originalCIC);
-        window.cancelIdleCallback.prototype = originalCIC.prototype; 
-        markAsNative(window.cancelIdleCallback);
+                if(SAFE_MODE || !isTabActuallyHidden) return originalCIC.apply(this, [id]);
+                if (pendingCallbacks.has(id))
+                {
+                    heartbeat.postMessage({ type: 'clear', id });
+                    pendingCallbacks.delete(id);
+                }
+                else
+                {
+                    originalClearTimeout(id);
+                }
+            };
+            Object.setPrototypeOf(window.cancelIdleCallback, originalCIC);
+            window.cancelIdleCallback.prototype = originalCIC.prototype; 
+            markAsNative(window.cancelIdleCallback);
+        }
 
         // ─── 14. IFRAME PATCHING ──────────────────────────────────────────────────
         const patchedIframes = new WeakSet();
@@ -722,7 +740,7 @@
                 // CRITICAL: Check if we can actually touch the window (Same-Origin Check)
                 // Accessing win.location.href on a cross-origin frame will throw.
                 const isSameOrigin = () => {
-                    try { return !!win.location.href || true; } 
+                    try { return !!win.location.href; } 
                     catch(e) { return false; }
                 };
                 if (!isSameOrigin()) {
@@ -797,22 +815,25 @@
 
         // Hook createElement — FIX #8: single registration point only.
         const originalCreateElement = document.createElement.bind(document);
-        document.createElement = function(tagName, ...args)
+        if (typeof originalCreateElement !== 'undefined')
         {
-            if (SAFE_MODE || !isTabActuallyHidden) return originalCreateElement.apply(this, [tagName, ...args]);
-            const el = originalCreateElement(tagName, ...args);
-            if (typeof tagName === 'string' && tagName.toLowerCase() === 'iframe')
+            document.createElement = function(tagName, ...args)
             {
-                rawListen(el, 'load', () => patchIframe(el));
-            }
-            return el;
-        };
-        Object.setPrototypeOf(document.createElement, originalCreateElement);
-        document.createElement.prototype = originalCreateElement.prototype; 
-        markAsNative(document.createElement);
+                if (SAFE_MODE || !isTabActuallyHidden) return originalCreateElement.apply(this, [tagName, ...args]);
+                const el = originalCreateElement(tagName, ...args);
+                if (typeof tagName === 'string' && tagName.toLowerCase() === 'iframe')
+                {
+                    rawListen(el, 'load', () => patchIframe(el));
+                }
+                return el;
+            };
+            Object.setPrototypeOf(document.createElement, originalCreateElement);
+            document.createElement.prototype = originalCreateElement.prototype; 
+            markAsNative(document.createElement);
+        }
 
         // Patch already-present iframes.
-        if (!SAFE_MODE || isTabActuallyHidden)
+        if (!SAFE_MODE)
             document.querySelectorAll('iframe').forEach(patchIframe);
 
         // Observe future iframes via MutationObserver.
@@ -832,120 +853,144 @@
         observer.observe(document.documentElement, { childList: true, subtree: true });
 
         const OriginalIO = window.IntersectionObserver;
-        window.IntersectionObserver = function(callback, options)
+        if (typeof OriginalIO !== 'undefined')
         {
-            if (SAFE_MODE || !isTabActuallyHidden) return Reflect.construct(OriginalIO, [callback, options]);
-            const wrappedCallback = (entries, observer) =>
+            window.IntersectionObserver = function(callback, options)
             {
-                const spoofedEntries = entries.map(entry =>
+                if (SAFE_MODE || !isTabActuallyHidden) return Reflect.construct(OriginalIO, [callback, options]);
+                const wrappedCallback = (entries, observer) =>
                 {
-                    // Force every entry to appear visible and in-viewport
-                    return new Proxy(entry,
+                    const spoofedEntries = entries.map(entry =>
                     {
-                        get: (target, prop) =>
+                        // Force every entry to appear visible and in-viewport
+                        return new Proxy(entry,
                         {
-                            if (prop === 'isIntersecting') return true;
-                            if (prop === 'intersectionRatio') return 1;
-                            return target[prop];
-                        }
+                            get: (target, prop) =>
+                            {
+                                if (prop === 'isIntersecting') return true;
+                                if (prop === 'intersectionRatio') return 1;
+                                return target[prop];
+                            }
+                        });
                     });
-                });
-                return callback(spoofedEntries, observer);
+                    return callback(spoofedEntries, observer);
+                };
+                return Reflect.construct(OriginalIO, [wrappedCallback, options]);
             };
-            return Reflect.construct(OriginalIO, [wrappedCallback, options]);
-        };
-        Object.setPrototypeOf(window.IntersectionObserver, OriginalIO);
-        window.IntersectionObserver.prototype = OriginalIO.prototype; 
-        markAsNative(window.IntersectionObserver);
+            Object.setPrototypeOf(window.IntersectionObserver, OriginalIO);
+            window.IntersectionObserver.prototype = OriginalIO.prototype; 
+            markAsNative(window.IntersectionObserver);
+        }
 
         // ─── 15. WORKER PATCHING ─────────────────────────────────────────────────
-        window.Worker = function WorkerProxy(scriptURL, options) {
-            if (SAFE_MODE || !isTabActuallyHidden) {
-                return OriginalWorker(scriptURL, options);
-            }
-            
-            // 1. Resolve relative URLs (e.g., "/worker.js") to absolute URLs 
-            // based on the current page's origin. This fixes the importScripts crash.
-            const absoluteUrl = new URL(scriptURL, window.location.href).href;
+        if (typeof OriginalWorker !== 'undefined')
+        {
+            window.Worker = function WorkerProxy(scriptURL, options) {
+                if (SAFE_MODE || !isTabActuallyHidden) {
+                    return new OriginalWorker(scriptURL, options);
+                }
+                
+                // Do NOT proxy blob: workers — these are typically internal workers
+                // (our own heartbeat, inline challenge workers) that must run verbatim.
+                // Do NOT proxy known security / bot-detection origins — intercepting
+                // their workers injects our onmessage handler before their script loads,
+                // which silently overwrites their message protocol and hangs the challenge.
+                const asStr = String(scriptURL);
+                if (asStr.startsWith('blob:')) {
+                    return new OriginalWorker(scriptURL, options);
+                }
+                if ([
+                    'challenges.cloudflare.com',
+                    'cloudflare.com',
+                    'recaptcha.net',
+                    'www.google.com',
+                    'www.gstatic.com',
+                ].includes(new URL(asStr, window.location.href).hostname)) {
+                    return new OriginalWorker(scriptURL, options);
+                }
+                
+                // 1. Resolve relative URLs (e.g., "/worker.js") to absolute URLs 
+                // based on the current page's origin. This fixes the importScripts crash.
+                const absoluteUrl = new URL(scriptURL, window.location.href).href;
 
-            // 2. The code we want to execute INSIDE the worker BEFORE the real script runs
-            const workerPatchCode = `
-                let virtualTime = performance.now();
-                let lastReal = performance.now();
-                let hidden = false;
-                const drift = ${CONFIG.driftFactor};
+                // 2. The code we want to execute INSIDE the worker BEFORE the real script runs
+                const workerPatchCode = `
+                    let virtualTime = performance.now();
+                    let lastReal = performance.now();
+                    let hidden = false;
+                    const drift = ${CONFIG.driftFactor};
 
-                const update = () => {
-                    const now = performance.now();
-                    const delta = now - lastReal;
-                    virtualTime += hidden ? delta * drift : delta;
-                    lastReal = now;
-                };
+                    const update = () => {
+                        const now = performance.now();
+                        const delta = now - lastReal;
+                        virtualTime += hidden ? delta * drift : delta;
+                        lastReal = now;
+                    };
 
-                const epochOffset = Date.now() - performance.now();
+                    const epochOffset = Date.now() - performance.now();
 
-                // Patch Globals
-                const origPerfNow = performance.now;
-                performance.now = function() { update(); return virtualTime; };
-                Date.now = function() { return Math.floor(epochOffset + performance.now()); };
+                    // Patch Globals
+                    const origPerfNow = performance.now;
+                    performance.now = function() { update(); return virtualTime; };
+                    Date.now = function() { return Math.floor(epochOffset + performance.now()); };
 
-                // Hide our sync messages from the real worker script
-                const origAddEventListener = self.addEventListener;
-                self.addEventListener = function(type, listener, opts) {
-                    if (type === 'message') {
-                        const wrapped = (e) => {
-                            if (e.data && e.data.__sync) return; // Drop our internal messages
-                            return listener.call(this, e);
-                        };
-                        return origAddEventListener.call(this, type, wrapped, opts);
-                    }
-                    return origAddEventListener.apply(this, arguments);
-                };
+                    // Hide our sync messages from the real worker script
+                    const origAddEventListener = self.addEventListener;
+                    self.addEventListener = function(type, listener, opts) {
+                        if (type === 'message') {
+                            const wrapped = (e) => {
+                                if (e.data && e.data.__sync) return; // Drop our internal messages
+                                return listener.call(this, e);
+                            };
+                            return origAddEventListener.call(this, type, wrapped, opts);
+                        }
+                        return origAddEventListener.apply(this, arguments);
+                    };
 
-                // Listen for main-thread synchronization
-                origAddEventListener.call(self, 'message', (e) => {
-                    if (e.data && e.data.__sync) {
-                        virtualTime = e.data.t;
-                        hidden = e.data.h;
-                        e.stopImmediatePropagation(); // Prevent other listeners from seeing this
-                    }
-                });
-            `;
-
-            // 3. Assemble the final Blob: Our patch runs FIRST, then we import the real script
-            const blobContent = `${workerPatchCode}\n\nimportScripts("${absoluteUrl}");`;
-            const blobUrl = URL.createObjectURL(new Blob([blobContent], { type: 'application/javascript' }));
-
-            // 4. Initialize the real worker using our patched Blob
-            const worker = new OriginalWorker(blobUrl, options);
-
-            Object.defineProperty(worker, 'scriptURL', {
-                configurable: true,
-                enumerable: true,
-                get: () => scriptURL,
-            });
-
-            // 5. Setup continuous synchronization from the Main Thread to the Worker
-            const syncState = () => {
-                try {
-                    worker.postMessage({ 
-                        __sync: true, 
-                        t: virtualTime, // from your main extension.js state
-                        h: isTabActuallyHidden 
+                    // Listen for main-thread synchronization
+                    origAddEventListener.call(self, 'message', (e) => {
+                        if (e.data && e.data.__sync) {
+                            virtualTime = e.data.t;
+                            hidden = e.data.h;
+                            e.stopImmediatePropagation(); // Prevent other listeners from seeing this
+                        }
                     });
-                } catch (e) {}
+                `;
+
+                // 3. Assemble the final Blob: Our patch runs FIRST, then we import the real script
+                const blobContent = `${workerPatchCode}\n\nimportScripts("${absoluteUrl}");`;
+                const blobUrl = URL.createObjectURL(new Blob([blobContent], { type: 'application/javascript' }));
+
+                // 4. Initialize the real worker using our patched Blob
+                const worker = new OriginalWorker(blobUrl, options);
+
+                Object.defineProperty(worker, 'scriptURL', {
+                    configurable: true,
+                    enumerable: true,
+                    get: () => scriptURL,
+                });
+
+                // 5. Setup continuous synchronization from the Main Thread to the Worker
+                const syncState = () => {
+                    try {
+                        worker.postMessage({ 
+                            __sync: true, 
+                            t: virtualTime, // from your main extension.js state
+                            h: isTabActuallyHidden 
+                        });
+                    } catch (e) {}
+                };
+
+                // Piggyback off your existing originalSetInterval
+                originalSetInterval.call(window, syncState, CONFIG.syncInterval);
+                syncState();
+
+                return worker;
             };
-
-            // Piggyback off your existing originalSetInterval
-            originalSetInterval.call(window, syncState, CONFIG.syncInterval);
-            syncState();
-
-            return worker;
-        };
-
-        Object.setPrototypeOf(window.Worker, OriginalWorker);
-        window.Worker.prototype = OriginalWorker.prototype;
-        markAsNative(window.Worker);
+            Object.setPrototypeOf(window.Worker, OriginalWorker);
+            window.Worker.prototype = OriginalWorker.prototype;
+            markAsNative(window.Worker);
+        }
 
         // ─── 16. BROADCAST CHANNEL — CROSS-TAB SYNC ──────────────────────────────
         channel.postMessage({ type: 'hello', id: tabId, ...getTimeState() });
@@ -1008,7 +1053,7 @@
             const wrapCode = (code) =>
             {
                 if (typeof code !== 'string') return code;
-                return `(function(performance, Date) {
+                return `return (function(performance, Date) {
     ${code}
     })(window.performance, window.Date);`;
             };
